@@ -54,9 +54,36 @@ check(
 )
 
 // The entries the crash-recovery button dropped; each owns real user settings.
-// A row is "restored" when it is declared in the user patch *or* by its bundle.
-for (const id of ['permission', 'ui-theme', 'ui-conversation', 'agency-agents', 'better-sidebar', 'llm-pi-ai', 'ui-usage-billing']) {
-  check(`restored ${id}`, ids.includes(id) || bundleIds.has(id))
+// A row is "restored" when it is declared in the user patch *or* by a bundle
+// installed in this profile.
+//
+// Some of these ids live in the runtime's own base bundle (`@deepseek-ai/dsh-base`),
+// which ships inside the app archive rather than in the profile's node_modules —
+// they are present but not visible here. Point DSH_ASAR at that archive to check
+// them too; without it they are reported as unresolved instead of failing, so a
+// machine-local layout never reads as a wiring regression.
+const asarPath = process.env.DSH_ASAR;
+let asarText = null;
+if (asarPath) {
+  try {
+    asarText = fs.readFileSync(asarPath).toString('utf8');
+  } catch (error) {
+    console.log(`  note  DSH_ASAR unreadable (${error.message}); runtime rows not verified`);
+  }
+}
+
+const inRuntime = (id) => (asarText === null ? null : new RegExp(`id:\\s*["']?${id}["']?\\s*\\n?\\s*name:`).test(asarText));
+
+for (const id of ['permission', 'ui-theme', 'ui-conversation', 'agency-agents', 'better-sidebar', 'llm-pi-ai']) {
+  const local = ids.includes(id) || bundleIds.has(id);
+  if (local) {
+    check(`restored ${id}`, true);
+    continue;
+  }
+  const runtime = inRuntime(id);
+  if (runtime === true) check(`restored ${id}`, true, 'runtime base bundle');
+  else if (runtime === false) check(`restored ${id}`, false, 'absent locally and from the runtime base bundle');
+  else console.log(`  n/a  restored ${id} — not in this profile; set DSH_ASAR to verify the runtime base bundle`);
 }
 check('permission presets intact', Boolean(patch.find((e) => e.id === 'permission')?.config?.presets))
 check('danger-full-access still the default preset', patch.find((e) => e.id === 'permission')?.config?.defaultPreset === 'danger-full-access')

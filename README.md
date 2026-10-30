@@ -192,17 +192,35 @@ globalThis.__DSH_DESKTOP_BRIDGE__ = {
 
 ## 兼容性
 
-插件只依赖四个宿主/客户端 API，且全部在**运行时验证过**，不是照文档猜的：
+插件只依赖五个宿主/客户端 API，全部按 **0.2.1-rc.5 的已装源码逐个核对**（不是照文档猜的），其中宿主半边另在运行中的进程上实测过。行为契约由 `test/contract.mjs`（23 项）、`test/defaults.mjs` 与 `test/host-apply.mjs`（11 项）覆盖。
 
-| 依赖的 API | 用途 | 在 0.2.1-rc.2 上核对结果 |
+| 依赖的 API | 用途 | 在 0.2.1-rc.5 上核对结果 |
 |---|---|---|
-| `webServer.register({kind, path, handler})` | 注册三条路由 | 仍在，冲突时仍抛 `webserver: duplicate exact route`，仍返回 disposer |
-| `webserver/index-inject` 事件 | 把 token 注入 index.html | 仍每次渲染都 emit，仍是 `{kind:'global', name, value}` |
-| `uiSession.sessionStatus` 快照 | 取 `running` / `pendingInteraction` / `completionUnread` 边沿 | 三个字段名与含义未变，`publishStatus()` 的结构逐字一致 |
-| `sessions.list` 的 `retainedBy.mainView` | 判断会话是否在主视图 | 仍在 |
-| `remote.$on("api-session/error", (sessionId, message)")` | 判定失败 | 仍在，签名与官方自己的客户端一致（`message` 为 stringified error） |
+| `webServer.register({kind, path, handler})` | 注册三条路由 | 仍在，冲突时仍抛 `webserver: duplicate ${kind} route "<path>"`（本插件用 `kind:'exact'`），仍返回 disposer |
+| `webserver/index-inject` 事件 | 把 token 注入 index.html | 仍在 `collectIndexInjections()` 里每次渲染 `this.ctx.emit("webserver/index-inject", table)`，签名仍是单参数 `(table)`；行仍是 `{kind:'global', name, value}`，桌面壳经 IPC 取同一张表 |
+| `uiSession.sessionStatus` 快照 | 取 `running` / `pendingInteraction` / `completionUnread` 边沿 | 三个字段名与含义未变，`publishStatus()` 结构逐字一致；`pendingInteraction` 仍是带 `kind` 的类实例（`approval` / `plan-review` / `question`） |
+| `sessions.list` 的 `retainedBy.mainView` | 判断会话是否在主视图 | 仍在，`isMain()` 仍按 `retainedBy.mainView` 判定 |
+| `remote.$on("api-session/error", (sessionId, message)")` | 判定失败 | 仍在 `API_REMOTE_FORWARDED_EVENTS` 白名单里（`mode:'emit'`，`resources.session`），`$on` 签名未变（`message` 为 stringified error） |
 
-**验证过的版本**：`@deepseek-ai/dsh` 0.2.1-rc.2（DeepSeek Harness 44.7.0）。
+**验证过的版本**：`@deepseek-ai/dsh` 0.2.1-rc.5（DeepSeek Harness 0.2.1-rc.5，Electron 44.7.0）。rc.3 → rc.5 之间这五个面**无需改代码**。
+
+rc.5 上除此之外的实测结论：
+
+- 宿主半边：`GET /__dsh-desktop-bridge/health` 返回 `kinds:["waiting","done","failed"]`；`test/host-apply.mjs` 11 项全过并真的弹出两条通知。
+- 浏览器半边：运行中页面的 combo URL `dsh-app://app/plugins/??…,dsh-desktop-bridge/client.js&rev=176ea727b2ac` 已包含本插件，Code Cache 有对应编译产物，说明页面确实取过这一版。
+- 真实投递：`notifier.log` 记录了升级后的「任务已完成」通知实际送达。
+
+rc.3 里与本插件相关、但**不影响行为**的变化，升级时不必改代码：
+
+- `webServer` 的 Config 收紧：`host` 必须是具体 IP 字面量（不再接受 `0.0.0.0`），并新增 `tls` 配置与 `getOrigin()`/`protocol`；插件只用 `register`，不受影响。
+- `client-modules` 的 bundle 路由开始拒绝 `client.node.js` 之类的包内 chunk，且 bundle 改为异步读取；插件只暴露一个 `client.js`，不受影响。
+- `dsh-client-ui-session` 的客户端 `inject` 增加了 `remoteAccess`，`apply()` 改为 `ctx.slots.provideRoot(...)`；插件只读 `ctx.uiSession.sessionStatus`，不受影响。
+- `dsh-desktop-host` 改为 `--host 127.0.0.1 --port 0`（端口每次随机），URL 用 `webServer.protocol` 拼；`/health` 仍从 DSH 自带 web 服务器读出实际端口。
+
+rc.5 上新增、同样**不影响行为**的两点：
+
+- `webServer` 新增 `registerUpgrade(route)` 与 fallback 座位（`register` 的语义、冲突文案、disposer 都未变）；插件只用 `register`。
+- Remote 转发条目 `api-session/error` 显式声明了 `resources: { session }`，只影响 Gateway 对非 owner Peer 的访问控制；owner 页面上的 `$on` 收到的参数不变。
 
 DSH 升级后如果通知失灵，先跑 `/health` 看 `kinds`；再对照上表看哪个 API 变了。升级最容易打破的两个点：
 
@@ -222,6 +240,8 @@ DSH 升级后如果通知失灵，先跑 `/health` 看 `kinds`；再对照上表
 - [x] **一轮只弹一次**：修掉 `completionUnread` 晚到导致的重复提示
 - [x] **真实失败轮次现场验证**：`06:20:59 toast: 任务失败 | 「问候交流」…：fetch failed`
 - [x] **适配 0.2.1-rc.2**：逐个核对五个 API 面，均未变
+- [x] **适配 0.2.1-rc.3**：五个 API 面按 rc.3 源码重新核对，均未变；同时把兼容性表里写错的冲突文案（实际是 `duplicate <kind> route`）和「四个 API」的笔误改正
+- [x] **适配 0.2.1-rc.5**：五个 API 面按 rc.5 源码重新核对，均未变；运行中进程 `/health` 正常、页面 combo URL 已含本插件、`notifier.log` 记录升级后的真实送达
 - [ ] **可选：点通知跳回对应会话**（当前只把 DSH 窗口拉到前台，不定位会话）
 - [ ] **可选：会话标题变化时更新去重键**（当前同秒同名事件会被去重）
 
