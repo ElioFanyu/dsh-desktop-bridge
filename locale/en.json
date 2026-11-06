@@ -1,0 +1,5 @@
+{
+  "meta": {
+    "description": "Windows notifications for DSH: a bottom-right toast when a session needs your confirmation, finishes, or fails. One plugin, no companion process."
+  }
+}

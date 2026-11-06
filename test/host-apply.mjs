@@ -18,6 +18,9 @@
  */
 
 import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { apply, inject, name as pluginName } from '../lib/index.js'
 
 let passed = 0
@@ -28,28 +31,56 @@ const check = (label, fn) => {
 }
 
 // ---------------------------------------------------------------------------
-// A ctx shaped like cordis', plus a webServer that records what it is handed.
+// A ctx shaped like cordis 4.1's, plus a webServer that records what it is
+// handed.
+//
+// The bus deliberately mirrors cordis 4.1 rather than a convenient fiction:
+// there is NO `off` on a context (the event mixin is on/once/parallel/emit/
+// serial/bail/waterfall), and `on()` returns the disposer. Getting this wrong
+// is what let the plugin ship a teardown that silently did nothing.
 // ---------------------------------------------------------------------------
 const routes = new Map()
-const bus = new Map()
+const busListeners = new Map()
 let injected = []
+
+/** Remove one exact listener, the way cordis' disposer does. */
+function unsubscribe(event, fn) {
+  const set = busListeners.get(event)
+  if (set === undefined) return
+  set.delete(fn)
+  if (set.size === 0) busListeners.delete(event)
+}
+
+const bus = {
+  on(event, fn) {
+    if (!busListeners.has(event)) busListeners.set(event, new Set())
+    busListeners.get(event).add(fn)
+    return () => unsubscribe(event, fn)
+  },
+  emit(event, ...args) {
+    for (const fn of [...(busListeners.get(event) ?? [])]) fn(...args)
+  },
+}
 
 const ctx = {
   effect: () => () => {},
-  logger: { info() {}, log() {} },
+  // cordis 4.1 always provides `on` on the plugin context itself.
+  on: bus.on,
+  emit: bus.emit,
+  // The real logger is a callable service with info/warn/error/debug and NO
+  // `log`; using `.log` silently dropped every diagnostic line.
+  logger: {
+    info() {},
+    warn() {},
+    error() {},
+    debug() {},
+  },
   webServer: {
     register(route) {
       routes.set(route.path, route)
       return () => routes.delete(route.path)
     },
-    ctx: {
-      on(event, fn) {
-        bus.set(event, fn)
-      },
-      off(event) {
-        bus.delete(event)
-      },
-    },
+    ctx: bus,
   },
 }
 
@@ -70,15 +101,31 @@ check('registers /ingest, /health and /probe, nothing else', () => {
 })
 
 check('publishes the token global into index.html', () => {
-  const listener = bus.get('webserver/index-inject')
-  assert.equal(typeof listener, 'function', 'no index-inject listener registered')
-  listener(injected)
+  const listeners = busListeners.get('webserver/index-inject')
+  assert.ok(listeners && listeners.size === 1, 'expected exactly one index-inject listener')
+  bus.emit('webserver/index-inject', injected)
   const row = injected.find((r) => r.kind === 'global')
   assert.ok(row, 'no global row pushed')
   assert.equal(row.name, '__DSH_DESKTOP_BRIDGE__')
   assert.equal(row.value.protocol, 1)
   assert.deepEqual(row.value.kinds, ['waiting', 'done', 'failed'], 'the page decides what to send from this list')
   assert.match(row.value.token, /^[0-9a-f]{48}$/, 'token must be 24 random bytes in hex')
+})
+
+// DSH 0.2.2 emits `(table, peer)`. An extra positional argument must not break
+// the row, and the row must be JSON-serializable, because the desktop shell
+// ships this table to the page over IPC rather than rendering it into HTML.
+check('tolerates the 0.2.2 (table, peer) emit signature', () => {
+  const table = []
+  bus.emit('webserver/index-inject', table, { id: 'peer-1' })
+  const row = table.find((r) => r.kind === 'global')
+  assert.ok(row, 'row missing when a peer argument is supplied')
+  assert.doesNotThrow(() => JSON.stringify(row.value), 'row value must survive the shell IPC hop')
+})
+
+check('ignores a non-array table instead of throwing', () => {
+  assert.doesNotThrow(() => bus.emit('webserver/index-inject', undefined))
+  assert.doesNotThrow(() => bus.emit('webserver/index-inject', 'nope'))
 })
 
 // ---------------------------------------------------------------------------
@@ -234,10 +281,38 @@ const event = {
   })
 }
 
+// The README tells users to diagnose a missing toast by grepping `notifier.log`
+// for `ingest:` / `dispatch:` lines. Those lines are only useful if the route
+// layer actually writes to that file rather than to the host console, which a
+// packaged desktop launch does not attach.
+check('route-layer diagnostics reach notifier.log', () => {
+  const logPath = join(homedir(), 'AppData', 'Local', 'dsh-desktop-notifier', 'notifier.log')
+  if (!existsSync(logPath)) {
+    assert.fail(`notifier.log was never written at ${logPath}`)
+  }
+  const text = readFileSync(logPath, 'utf8')
+  assert.match(text, /ingest: waiting/, 'the ingest line the README keys on is missing')
+  assert.match(text, /dispatch: shown — waiting/, 'the dispatch verdict the README keys on is missing')
+  assert.match(text, /auth: POST \/ingest rejected/, 'the auth rejection the README keys on is missing')
+})
+
 dispose()
 
-check('dispose unregisters both routes', () => {
+check('dispose unregisters every route', () => {
   assert.deepEqual([...routes.keys()], [])
+})
+
+// The regression this guards: cordis 4.1 has no `ctx.off`, so the old teardown
+// was a no-op and the listener kept injecting a dead token after unload.
+check('dispose removes the index-inject listener', () => {
+  assert.equal(busListeners.get('webserver/index-inject'), undefined, 'the listener survived dispose')
+  const after = []
+  bus.emit('webserver/index-inject', after)
+  assert.deepEqual(after, [], 'a disposed plugin must not inject anything')
+})
+
+check('dispose is safe to run twice', () => {
+  assert.doesNotThrow(() => dispose())
 })
 
 console.log(`\n${passed} checks passed\n`)

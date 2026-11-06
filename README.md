@@ -192,40 +192,69 @@ globalThis.__DSH_DESKTOP_BRIDGE__ = {
 
 ## 兼容性
 
-插件只依赖五个宿主/客户端 API，全部按 **0.2.1-rc.5 的已装源码逐个核对**（不是照文档猜的），其中宿主半边另在运行中的进程上实测过。行为契约由 `test/contract.mjs`（23 项）、`test/defaults.mjs` 与 `test/host-apply.mjs`（11 项）覆盖。
+插件只依赖五个宿主/客户端 API，全部按 **0.2.2-rc.1 的已装源码逐个核对**（不是照文档猜的），宿主半边另在真实 cordis 4.1 运行时上跑过一遍 apply → 注入 → dispose 全生命周期。行为契约由 `test/contract.mjs`（23 项）、`test/defaults.mjs` 与 `test/host-apply.mjs`（16 项）覆盖。
 
-| 依赖的 API | 用途 | 在 0.2.1-rc.5 上核对结果 |
+| 依赖的 API | 用途 | 在 0.2.2-rc.1 上核对结果 |
 |---|---|---|
 | `webServer.register({kind, path, handler})` | 注册三条路由 | 仍在，冲突时仍抛 `webserver: duplicate ${kind} route "<path>"`（本插件用 `kind:'exact'`），仍返回 disposer |
-| `webserver/index-inject` 事件 | 把 token 注入 index.html | 仍在 `collectIndexInjections()` 里每次渲染 `this.ctx.emit("webserver/index-inject", table)`，签名仍是单参数 `(table)`；行仍是 `{kind:'global', name, value}`，桌面壳经 IPC 取同一张表 |
+| `webserver/index-inject` 事件 | 把 token 注入 index.html | 签名从 `(table)` 扩成 **`(table, peer)`**：`collectIndexInjections()` 里是 `this.ctx.emit("webserver/index-inject", table, peer)`。多出来的 `peer` 对本插件无意义（token 认证的是路由，不是 Peer），监听器只读第一个参数，两个版本都能工作 |
 | `uiSession.sessionStatus` 快照 | 取 `running` / `pendingInteraction` / `completionUnread` 边沿 | 三个字段名与含义未变，`publishStatus()` 结构逐字一致；`pendingInteraction` 仍是带 `kind` 的类实例（`approval` / `plan-review` / `question`） |
 | `sessions.list` 的 `retainedBy.mainView` | 判断会话是否在主视图 | 仍在，`isMain()` 仍按 `retainedBy.mainView` 判定 |
 | `remote.$on("api-session/error", (sessionId, message)")` | 判定失败 | 仍在 `API_REMOTE_FORWARDED_EVENTS` 白名单里（`mode:'emit'`，`resources.session`），`$on` 签名未变（`message` 为 stringified error） |
 
-**验证过的版本**：`@deepseek-ai/dsh` 0.2.1-rc.5（DeepSeek Harness 0.2.1-rc.5，Electron 44.7.0）。rc.3 → rc.5 之间这五个面**无需改代码**。
+### 0.2.2-rc.1 真正踩到的两处
 
-rc.5 上除此之外的实测结论：
+这两处不是「文档说是这样」，是**在真实 cordis 4.1 上跑出来**的：
 
-- 宿主半边：`GET /__dsh-desktop-bridge/health` 返回 `kinds:["waiting","done","failed"]`；`test/host-apply.mjs` 11 项全过并真的弹出两条通知。
-- 浏览器半边：运行中页面的 combo URL `dsh-app://app/plugins/??…,dsh-desktop-bridge/client.js&rev=176ea727b2ac` 已包含本插件，Code Cache 有对应编译产物，说明页面确实取过这一版。
+**1. cordis 4.1 没有 `ctx.off`。** 事件 mixin 只有 `on` / `once` / `parallel` / `emit` / `serial` / `bail` / `waterfall`（`@deepseek-ai/cordis` 4.0.4 与 4.1.0 都是如此）。旧代码的退订写成：
+
+```js
+bus.on('webserver/index-inject', listener)
+disposers.push(() => bus.off?.('webserver/index-inject', listener))  // off 不存在 → 什么都没做
+```
+
+`?.` 让这行静默通过，于是**监听器活过了 dispose**，插件卸载后每次渲染 index 都会再塞进一个已失效的 token。正确做法是用 `on()` 的返回值——它本身就是这个监听器的退订器，且随 fiber 自动释放：
+
+```js
+const off = bus.on('webserver/index-inject', listener)
+disposers.push(typeof off === 'function' ? off : () => bus.off?.(...))
+```
+
+订阅也改挂在插件自己的 `ctx` 上（事件总线在整棵树里是共用的，宿主 `webServer.ctx` 的 emit 一样能收到），这样 teardown 由 cordis 的 fiber 作用域兜底，而不是靠插件手写。
+
+**2. `ctx.logger` 上根本没有 `.log`。** 它是可调用的 logger 服务，方法只有 `error` / `warn` / `info` / `debug`。旧代码按 `['info', 'log']` 依次找，找到 `info` 就 `return`，表面上「有日志」，实际全进了宿主控制台——而**打包后的桌面版宿主子进程没有挂控制台**，于是 `notifier.log` 里连一条 `ingest:` 都没有（历史日志实测：`toast:` 250 条，`ingest:` 0 条）。这也让 README「没弹窗怎么查」那张表**失效**：表里让你 grep 的 `ingest:` / `dispatch:` / `auth:` 三种行，当时一条都写不进文件。
+
+现在 `log()` 同时写两处：`notifier.log`（README 让你读的那个文件）+ cordis logger（DSH 自己的启动诊断）。`test/host-apply.mjs` 增加了断言，直接检查这个文件里确实出现了那三种行。
+
+**验证过的版本**：`@deepseek-ai/dsh` 0.2.2-rc.1（DeepSeek Harness 0.2.2-rc.1，Electron 44.7.0，cordis 4.1.0，Node 24.21.0）。
+
+0.2.2-rc.1 上除此之外的核对结论（均**不需要改代码**）：
+
+- `webServer` 新增 `resource` 型路由与 `registerFallback({resource})`、`readResource()`、`serveResource()`；插件用的是 `handler` 型 `exact` 路由，语义与 disposer 都没变。
+- `client-modules` 新增包内 `./assets/*` 资源路由（`/plugins/<pkg>/assets/<path>`）与按 Loader entry 名的增量对账；插件只暴露一个 `client.js`，不受影响。
+- `client-ui-session` 的客户端 `inject` 多了 `remoteAccess`、`apply()` 走 `ctx.slots.provideRoot(...)`；插件只读 `ctx.uiSession.sessionStatus`，不受影响。
+- `api-remotes` 的白名单新增 `llm/models-updated`、`plugin-manager/update-state`；`api-session/error` 条目逐字未变。
+- `api-gateway` 客户端把 `privateEvents(ctx)` 从返回 `ctx` 改成返回 `ctx.events`（`$on` 的落点），对外签名不变。
+
+### 上一轮（0.2.1-rc.5）的核对结论
+
+rc.3 → rc.5 之间那五个面**无需改代码**，rc.5 上的实测结论也仍然成立：
+
+- 宿主半边：`GET /__dsh-desktop-bridge/health` 返回 `kinds:["waiting","done","failed"]`；`test/host-apply.mjs` 全过并真的弹出两条通知。
+- 浏览器半边：运行中页面的 combo URL `dsh-app://app/plugins/??…,dsh-desktop-bridge/client.js&rev=…` 已包含本插件，Code Cache 有对应编译产物。
 - 真实投递：`notifier.log` 记录了升级后的「任务已完成」通知实际送达。
 
 rc.3 里与本插件相关、但**不影响行为**的变化，升级时不必改代码：
 
 - `webServer` 的 Config 收紧：`host` 必须是具体 IP 字面量（不再接受 `0.0.0.0`），并新增 `tls` 配置与 `getOrigin()`/`protocol`；插件只用 `register`，不受影响。
 - `client-modules` 的 bundle 路由开始拒绝 `client.node.js` 之类的包内 chunk，且 bundle 改为异步读取；插件只暴露一个 `client.js`，不受影响。
-- `dsh-client-ui-session` 的客户端 `inject` 增加了 `remoteAccess`，`apply()` 改为 `ctx.slots.provideRoot(...)`；插件只读 `ctx.uiSession.sessionStatus`，不受影响。
 - `dsh-desktop-host` 改为 `--host 127.0.0.1 --port 0`（端口每次随机），URL 用 `webServer.protocol` 拼；`/health` 仍从 DSH 自带 web 服务器读出实际端口。
 
-rc.5 上新增、同样**不影响行为**的两点：
-
-- `webServer` 新增 `registerUpgrade(route)` 与 fallback 座位（`register` 的语义、冲突文案、disposer 都未变）；插件只用 `register`。
-- Remote 转发条目 `api-session/error` 显式声明了 `resources: { session }`，只影响 Gateway 对非 owner Peer 的访问控制；owner 页面上的 `$on` 收到的参数不变。
-
-DSH 升级后如果通知失灵，先跑 `/health` 看 `kinds`；再对照上表看哪个 API 变了。升级最容易打破的两个点：
+DSH 升级后如果通知失灵，先跑 `/health` 看 `kinds`；再对照上表看哪个 API 变了。升级最容易打破的三个点：
 
 1. `sessionStatus` 快照字段改名或增删 → 页面永远算不出边沿，`received` 一直不涨
 2. `api-session/error` 改事件名或参数顺序 → 失败退回「一律报完成」
+3. `ctx.off` 这类**不存在的方法**被 `?.` 静默吞掉 → 功能看着正常，只在卸载/重载时泄露。这类问题测试比手读源码可靠，`test/host-apply.mjs` 的 dispose 断言就是为它加的。
 
 ## 任务清单
 
@@ -242,6 +271,7 @@ DSH 升级后如果通知失灵，先跑 `/health` 看 `kinds`；再对照上表
 - [x] **适配 0.2.1-rc.2**：逐个核对五个 API 面，均未变
 - [x] **适配 0.2.1-rc.3**：五个 API 面按 rc.3 源码重新核对，均未变；同时把兼容性表里写错的冲突文案（实际是 `duplicate <kind> route`）和「四个 API」的笔误改正
 - [x] **适配 0.2.1-rc.5**：五个 API 面按 rc.5 源码重新核对，均未变；运行中进程 `/health` 正常、页面 combo URL 已含本插件、`notifier.log` 记录升级后的真实送达
+- [x] **适配 0.2.2-rc.1**：在真实 cordis 4.1 上跑出两处旧代码就存在的缺陷并修掉——`ctx.off` 不存在导致 index-inject 监听器无法解绑（用 `on()` 返回的 disposer 替代，并改挂插件自身 fiber），`ctx.logger.log` 不存在导致诊断行只进控制台、`notifier.log` 永远是空的（改为双写，README 的排查表恢复有效）。`index-inject` 新签名 `(table, peer)` 已兼容；两项新增断言在旧代码上会失败，已验证
 - [ ] **可选：点通知跳回对应会话**（当前只把 DSH 窗口拉到前台，不定位会话）
 - [ ] **可选：会话标题变化时更新去重键**（当前同秒同名事件会被去重）
 
