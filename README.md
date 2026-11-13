@@ -192,43 +192,46 @@ globalThis.__DSH_DESKTOP_BRIDGE__ = {
 
 ## 兼容性
 
-插件只依赖五个宿主/客户端 API，全部按 **0.2.2-rc.1 的已装源码逐个核对**（不是照文档猜的），宿主半边另在真实 cordis 4.1 运行时上跑过一遍 apply → 注入 → dispose 全生命周期。行为契约由 `test/contract.mjs`（23 项）、`test/defaults.mjs` 与 `test/host-apply.mjs`（16 项）覆盖。
+插件只依赖五个宿主/客户端 API，全部按 **0.2.2-rc.2 的已装源码逐个核对**（不是照文档猜的），宿主半边另在真实 cordis 4.1 运行时上跑过一遍 apply → 注入 → dispose 全生命周期。行为契约由 `test/contract.mjs`（23 项）、`test/defaults.mjs`、`test/host-apply.mjs`（16 项）与 `test/runtime.mjs`（9 项，跑在真实 cordis 上）覆盖。
 
-| 依赖的 API | 用途 | 在 0.2.2-rc.1 上核对结果 |
+| 依赖的 API | 用途 | 在 0.2.2-rc.2 上核对结果 |
 |---|---|---|
 | `webServer.register({kind, path, handler})` | 注册三条路由 | 仍在，冲突时仍抛 `webserver: duplicate ${kind} route "<path>"`（本插件用 `kind:'exact'`），仍返回 disposer |
-| `webserver/index-inject` 事件 | 把 token 注入 index.html | 签名从 `(table)` 扩成 **`(table, peer)`**：`collectIndexInjections()` 里是 `this.ctx.emit("webserver/index-inject", table, peer)`。多出来的 `peer` 对本插件无意义（token 认证的是路由，不是 Peer），监听器只读第一个参数，两个版本都能工作 |
+| `webserver/index-inject` 事件 | 把 token 注入 index.html | 签名自 rc.1 起为 **`(table, peer)`**：`collectIndexInjections()` 里是 `this.ctx.emit("webserver/index-inject", table, peer)`。多出来的 `peer` 对本插件无意义（token 认证的是路由，不是 Peer），监听器只读第一个参数 |
 | `uiSession.sessionStatus` 快照 | 取 `running` / `pendingInteraction` / `completionUnread` 边沿 | 三个字段名与含义未变，`publishStatus()` 结构逐字一致；`pendingInteraction` 仍是带 `kind` 的类实例（`approval` / `plan-review` / `question`） |
 | `sessions.list` 的 `retainedBy.mainView` | 判断会话是否在主视图 | 仍在，`isMain()` 仍按 `retainedBy.mainView` 判定 |
 | `remote.$on("api-session/error", (sessionId, message)")` | 判定失败 | 仍在 `API_REMOTE_FORWARDED_EVENTS` 白名单里（`mode:'emit'`，`resources.session`），`$on` 签名未变（`message` 为 stringified error） |
 
-### 0.2.2-rc.1 真正踩到的两处
+### 0.2.2 上真正踩到的一处
 
-这两处不是「文档说是这样」，是**在真实 cordis 4.1 上跑出来**的：
+这一处不是「文档说是这样」，是**在真实 cordis 4.1 上跑出来**的：
 
-**1. cordis 4.1 没有 `ctx.off`。** 事件 mixin 只有 `on` / `once` / `parallel` / `emit` / `serial` / `bail` / `waterfall`（`@deepseek-ai/cordis` 4.0.4 与 4.1.0 都是如此）。旧代码的退订写成：
+**`ctx.logger` 上根本没有 `.log`。** 它是可调用的 logger 服务，方法只有 `error` / `warn` / `info` / `debug`。旧代码按 `['info', 'log']` 依次找，找到 `info` 就 `return`，表面上「有日志」，实际全进了宿主控制台——而**打包后的桌面版宿主子进程没有挂控制台**，于是 `notifier.log` 里连一条 `ingest:` 都没有（历史日志实测：`toast:` 250 条，`ingest:` 0 条）。这也让 README「没弹窗怎么查」那张表**失效**：表里让你 grep 的 `ingest:` / `dispatch:` / `auth:` 三种行，当时一条都写不进文件。
+
+现在 `log()` 同时写两处：`notifier.log`（README 让你读的那个文件）+ cordis logger（DSH 自己的启动诊断）。修复后同一台机器实测：`ingest:` 与 `dispatch:` 各 192 条，`auth:` 5 条，三种 grep 目标全部落地。
+
+### 关于 `ctx.off`：一个需要澄清的说法
+
+cordis 4.1 的事件 mixin 只有 `on` / `once` / `parallel` / `emit` / `serial` / `bail` / `waterfall`，**没有 `off`**（4.0.4 与 4.1.0 都一样，已实测 `typeof ctx.off === 'undefined'`）。旧代码的退订写成：
 
 ```js
 bus.on('webserver/index-inject', listener)
-disposers.push(() => bus.off?.('webserver/index-inject', listener))  // off 不存在 → 什么都没做
+disposers.push(() => bus.off?.('webserver/index-inject', listener))  // off 不存在 → 这行什么也没做
 ```
 
-`?.` 让这行静默通过，于是**监听器活过了 dispose**，插件卸载后每次渲染 index 都会再塞进一个已失效的 token。正确做法是用 `on()` 的返回值——它本身就是这个监听器的退订器，且随 fiber 自动释放：
+这段代码后来被改成使用 `on()` 返回的 disposer，当时的说明是「监听器会活过 dispose」。**这个说法是错的**，已更正：cordis 在 `register()` 内部用 `this.ctx.fiber.effect(...)` 把每个监听器绑到 fiber 上，fiber 销毁时 hook 会被自动移除。实测把服务挂在独立 fiber、用旧写法跑 apply → dispose，hook 数量是 `0 → 1 → 0`，并没有泄漏。
 
-```js
-const off = bus.on('webserver/index-inject', listener)
-disposers.push(typeof off === 'function' ? off : () => bus.off?.(...))
-```
+所以旧写法的真实缺陷是**退订路径是死的**，而不是泄漏：
 
-订阅也改挂在插件自己的 `ctx` 上（事件总线在整棵树里是共用的，宿主 `webServer.ctx` 的 emit 一样能收到），这样 teardown 由 cordis 的 fiber 作用域兜底，而不是靠插件手写。
+- `bus.off?.(...)` 是一次静默失败，代码看起来做了清理，实际什么都没做；
+- 它在今天不出事，完全依赖「宿主会销毁那个 fiber」这一隐含前提；
+- 一旦宿主不销毁 fiber（或被别处复用），漏掉的就会是真的泄漏。
 
-**2. `ctx.logger` 上根本没有 `.log`。** 它是可调用的 logger 服务，方法只有 `error` / `warn` / `info` / `debug`。旧代码按 `['info', 'log']` 依次找，找到 `info` 就 `return`，表面上「有日志」，实际全进了宿主控制台——而**打包后的桌面版宿主子进程没有挂控制台**，于是 `notifier.log` 里连一条 `ingest:` 都没有（历史日志实测：`toast:` 250 条，`ingest:` 0 条）。这也让 README「没弹窗怎么查」那张表**失效**：表里让你 grep 的 `ingest:` / `dispatch:` / `auth:` 三种行，当时一条都写不进文件。
+改成 `on()` 返回的 disposer 是**正确形式**而非「修了一个正在发生的 bug」：它显式、不依赖 fiber 生命周期、并且 `off` 链到 `undefined` 时不会伪装成功。`test/runtime.mjs` 把这条钉住了。
 
-现在 `log()` 同时写两处：`notifier.log`（README 让你读的那个文件）+ cordis logger（DSH 自己的启动诊断）。`test/host-apply.mjs` 增加了断言，直接检查这个文件里确实出现了那三种行。
+**验证过的版本**：`@deepseek-ai/dsh` 0.2.2-rc.2（DeepSeek Harness 0.2.2-rc.2，Electron 44.7.0，cordis 4.1.0，Node 24.21.0）。
 
-**验证过的版本**：`@deepseek-ai/dsh` 0.2.2-rc.1（DeepSeek Harness 0.2.2-rc.1，Electron 44.7.0，cordis 4.1.0，Node 24.21.0）。
-
-0.2.2-rc.1 上除此之外的核对结论（均**不需要改代码**）：
+0.2.2-rc.2 上除此之外的核对结论（均**不需要改代码**）：
 
 - `webServer` 新增 `resource` 型路由与 `registerFallback({resource})`、`readResource()`、`serveResource()`；插件用的是 `handler` 型 `exact` 路由，语义与 disposer 都没变。
 - `client-modules` 新增包内 `./assets/*` 资源路由（`/plugins/<pkg>/assets/<path>`）与按 Loader entry 名的增量对账；插件只暴露一个 `client.js`，不受影响。
@@ -254,7 +257,8 @@ DSH 升级后如果通知失灵，先跑 `/health` 看 `kinds`；再对照上表
 
 1. `sessionStatus` 快照字段改名或增删 → 页面永远算不出边沿，`received` 一直不涨
 2. `api-session/error` 改事件名或参数顺序 → 失败退回「一律报完成」
-3. `ctx.off` 这类**不存在的方法**被 `?.` 静默吞掉 → 功能看着正常，只在卸载/重载时泄露。这类问题测试比手读源码可靠，`test/host-apply.mjs` 的 dispose 断言就是为它加的。
+3. **`?.` 吞掉不存在的方法。** `ctx.off?.()` 看着跑了，实际什么都没做；`ctx.logger.log` 被 `['info','log']` 的短路绕开，日志全进了没人在看的地方。手读源码很难发现，`test/runtime.mjs` 在真实 cordis 上跑 apply 就是为了让这类调用抛出来。
+4. **两半不同步。** 刷新页面就换了新的 `lib/client.js`，而 `lib/index.js` 要重启 DSH 才换——日志证据也来自重启之后（`ingest:` 从 0 条变 192 条）。
 
 ## 任务清单
 
@@ -272,6 +276,7 @@ DSH 升级后如果通知失灵，先跑 `/health` 看 `kinds`；再对照上表
 - [x] **适配 0.2.1-rc.3**：五个 API 面按 rc.3 源码重新核对，均未变；同时把兼容性表里写错的冲突文案（实际是 `duplicate <kind> route`）和「四个 API」的笔误改正
 - [x] **适配 0.2.1-rc.5**：五个 API 面按 rc.5 源码重新核对，均未变；运行中进程 `/health` 正常、页面 combo URL 已含本插件、`notifier.log` 记录升级后的真实送达
 - [x] **适配 0.2.2-rc.1**：在真实 cordis 4.1 上跑出两处旧代码就存在的缺陷并修掉——`ctx.off` 不存在导致 index-inject 监听器无法解绑（用 `on()` 返回的 disposer 替代，并改挂插件自身 fiber），`ctx.logger.log` 不存在导致诊断行只进控制台、`notifier.log` 永远是空的（改为双写，README 的排查表恢复有效）。`index-inject` 新签名 `(table, peer)` 已兼容；两项新增断言在旧代码上会失败，已验证
+- [x] **适配 0.2.2-rc.2**：五个 API 面按 rc.2 源码重新核对（与 rc.1 逐字节 diff + npm 权威包校验），全部未变，插件代码无需改动。新增 `test/runtime.mjs`（9 项）——在**真实 cordis 4.1** 上跑 apply → 注入 → dispose，任何调用不存在的方法都会当场抛错。同时更正上一轮夸大的说法：`ctx.off?.()` 的退订路径确实是死的，但监听器**并没有**泄漏，cordis 在 `register()` 内部用 fiber effect 兜住了（实测 hook 数 `0 → 1 → 0`）
 - [ ] **可选：点通知跳回对应会话**（当前只把 DSH 窗口拉到前台，不定位会话）
 - [ ] **可选：会话标题变化时更新去重键**（当前同秒同名事件会被去重）
 
@@ -282,9 +287,19 @@ node test/contract.mjs    # 浏览器半边：信封格式、inject 完整性、
 node test/defaults.mjs    # 默认值与路由命名：默认静音这类回归由它守着
 node test/host-apply.mjs  # 宿主半边：路由注册、token 注入、鉴权、去重、kinds 声明
                           # 会真的弹两条通知，这是刻意的
+node test/runtime.mjs     # 在真实 cordis 上跑 apply → 注入 → dispose（见下）
 node scripts/check-bundle.mjs    # bundle 静态契约
 node scripts/verify-profile.mjs  # profile 接线是否完好
 ```
+
+`test/runtime.mjs` 需要一个能解析到 `@deepseek-ai/cordis` 的目录，因为它的全部价值就在于用**真的** cordis 而不是 mock：
+
+```bash
+# 指向装好的 DSH 运行时（node_modules/@deepseek-ai/cordis 所在目录的上一级）
+DSH_CORDIS_ROOT=/path/to/workspace node test/runtime.mjs
+```
+
+找不到 cordis 时它会打印一行说明并以 0 退出——裸检出仍然能跑其余测试，但它**不算通过**，别把跳过当成绿灯。这个文件是唯一能抓住「调用了 cordis 没有的方法」的测试：mock 会配合插件返回任何东西，真实运行时不会。
 
 ## 安装
 

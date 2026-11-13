@@ -15,9 +15,10 @@
     "dsh": ">=0.2.1-rc.2 <0.3.0-0"
   },
   "scripts": {
-    "test": "node test/contract.mjs && node test/host-apply.mjs",
+    "test": "node test/contract.mjs && node test/host-apply.mjs && node test/runtime.mjs",
     "test:bundle": "node test/contract.mjs",
     "test:host": "node test/host-apply.mjs",
+    "test:runtime": "node test/runtime.mjs",
     "check": "node scripts/check-bundle.mjs && node scripts/verify-profile.mjs",
     "check:profile": "node scripts/verify-profile.mjs",
     "register-aumid": "node scripts/register-aumid.mjs",
@@ -30,7 +31,8 @@
         "0.2.1-rc.2": "compatible",
         "0.2.1-rc.3": "compatible",
         "0.2.1-rc.5": "compatible",
-        "0.2.2-rc.1": "compatible"
+        "0.2.2-rc.1": "compatible",
+        "0.2.2-rc.2": "compatible"
       }
     },
     "bundle": {
