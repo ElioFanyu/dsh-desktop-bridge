@@ -192,9 +192,9 @@ globalThis.__DSH_DESKTOP_BRIDGE__ = {
 
 ## 兼容性
 
-插件只依赖五个宿主/客户端 API，全部按 **0.2.2-rc.2 的已装源码逐个核对**（不是照文档猜的），宿主半边另在真实 cordis 4.1 运行时上跑过一遍 apply → 注入 → dispose 全生命周期。行为契约由 `test/contract.mjs`（23 项）、`test/defaults.mjs`、`test/host-apply.mjs`（16 项）与 `test/runtime.mjs`（9 项，跑在真实 cordis 上）覆盖。
+插件只依赖五个宿主/客户端 API，全部按 **0.2.2-rc.5 的已装源码逐个核对**（不是照文档猜的），宿主半边另在真实 cordis 4.1 运行时上跑过一遍 apply → 注入 → dispose 全生命周期。行为契约由 `test/contract.mjs`（23 项）、`test/defaults.mjs`、`test/host-apply.mjs`（16 项）与 `test/runtime.mjs`（9 项，跑在真实 cordis 上）覆盖。
 
-| 依赖的 API | 用途 | 在 0.2.2-rc.2 上核对结果 |
+| 依赖的 API | 用途 | 在 0.2.2-rc.5 上核对结果 |
 |---|---|---|
 | `webServer.register({kind, path, handler})` | 注册三条路由 | 仍在，冲突时仍抛 `webserver: duplicate ${kind} route "<path>"`（本插件用 `kind:'exact'`），仍返回 disposer |
 | `webserver/index-inject` 事件 | 把 token 注入 index.html | 签名自 rc.1 起为 **`(table, peer)`**：`collectIndexInjections()` 里是 `this.ctx.emit("webserver/index-inject", table, peer)`。多出来的 `peer` 对本插件无意义（token 认证的是路由，不是 Peer），监听器只读第一个参数 |
@@ -229,9 +229,9 @@ disposers.push(() => bus.off?.('webserver/index-inject', listener))  // off 不�
 
 改成 `on()` 返回的 disposer 是**正确形式**而非「修了一个正在发生的 bug」：它显式、不依赖 fiber 生命周期、并且 `off` 链到 `undefined` 时不会伪装成功。`test/runtime.mjs` 把这条钉住了。
 
-**验证过的版本**：`@deepseek-ai/dsh` 0.2.2-rc.2（DeepSeek Harness 0.2.2-rc.2，Electron 44.7.0，cordis 4.1.0，Node 24.21.0）。
+**验证过的版本**：`@deepseek-ai/dsh` 0.2.2-rc.5（DeepSeek Harness 0.2.2-rc.5，Electron 44.7.0，cordis 4.1.0，Node 24.21.0）。
 
-0.2.2-rc.2 上除此之外的核对结论（均**不需要改代码**）：
+0.2.2-rc.5 上除此之外的核对结论（均**不需要改代码**）：
 
 - `webServer` 新增 `resource` 型路由与 `registerFallback({resource})`、`readResource()`、`serveResource()`；插件用的是 `handler` 型 `exact` 路由，语义与 disposer 都没变。
 - `client-modules` 新增包内 `./assets/*` 资源路由（`/plugins/<pkg>/assets/<path>`）与按 Loader entry 名的增量对账；插件只暴露一个 `client.js`，不受影响。
@@ -275,8 +275,9 @@ DSH 升级后如果通知失灵，先跑 `/health` 看 `kinds`；再对照上表
 - [x] **适配 0.2.1-rc.2**：逐个核对五个 API 面，均未变
 - [x] **适配 0.2.1-rc.3**：五个 API 面按 rc.3 源码重新核对，均未变；同时把兼容性表里写错的冲突文案（实际是 `duplicate <kind> route`）和「四个 API」的笔误改正
 - [x] **适配 0.2.1-rc.5**：五个 API 面按 rc.5 源码重新核对，均未变；运行中进程 `/health` 正常、页面 combo URL 已含本插件、`notifier.log` 记录升级后的真实送达
-- [x] **适配 0.2.2-rc.1**：在真实 cordis 4.1 上跑出两处旧代码就存在的缺陷并修掉——`ctx.off` 不存在导致 index-inject 监听器无法解绑（用 `on()` 返回的 disposer 替代，并改挂插件自身 fiber），`ctx.logger.log` 不存在导致诊断行只进控制台、`notifier.log` 永远是空的（改为双写，README 的排查表恢复有效）。`index-inject` 新签名 `(table, peer)` 已兼容；两项新增断言在旧代码上会失败，已验证
-- [x] **适配 0.2.2-rc.2**：五个 API 面按 rc.2 源码重新核对（与 rc.1 逐字节 diff + npm 权威包校验），全部未变，插件代码无需改动。新增 `test/runtime.mjs`（9 项）——在**真实 cordis 4.1** 上跑 apply → 注入 → dispose，任何调用不存在的方法都会当场抛错。同时更正上一轮夸大的说法：`ctx.off?.()` 的退订路径确实是死的，但监听器**并没有**泄漏，cordis 在 `register()` 内部用 fiber effect 兜住了（实测 hook 数 `0 → 1 → 0`）
+- [x] **适配 0.2.2-rc.1**：`ctx.logger.log` 不存在导致诊断行只进控制台、`notifier.log` 永远是空的（改为文件 + logger 双写，README 的排查表恢复有效）；`webserver/index-inject` 新签名 `(table, peer)` 已兼容。`ctx.off` 那条另见 rc.2 的更正——退订路径确实是死的，但没有造成泄漏
+- [x] **适配 0.2.2-rc.2**：五个 API 面逐字节 diff 确认未变。新增 `test/runtime.mjs`（9 项）——在**真实 cordis 4.1** 上跑 apply → 注入 → dispose，任何调用不存在的方法都会当场抛错。同时更正上一轮夸大的说法：`ctx.off?.()` 的退订路径确实是死的，但监听器**并没有**泄漏，cordis 在 `register()` 内部用 fiber effect 兜住了（实测 hook 数 `0 → 1 → 0`）
+- [x] **适配 0.2.2-rc.5**：五个 API 面按 rc.5 源码重新核对，全部未变，插件代码无需改动。核对基准是 npm 权威发布包（rc.2 与 rc.5 逐字节 cmp），并用 SHA256 反验本机 app.asar 提取物与 npm 包逐文件一致（10155 个文件全过），避免拿偏移量算错的提取结果当基准。`test/runtime.mjs` 在 rc.5 的 cordis 4.1 上 9 项全过；运行中实例 `/health` 正常（received/shown 各 15 次），`notifier.log` 里 `ingest:` 380 条、`dispatch:` 384 条
 - [ ] **可选：点通知跳回对应会话**（当前只把 DSH 窗口拉到前台，不定位会话）
 - [ ] **可选：会话标题变化时更新去重键**（当前同秒同名事件会被去重）
 
